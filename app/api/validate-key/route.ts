@@ -12,6 +12,10 @@ function sanitizeModel(model: string): string {
   return allowed.has(base) ? base : "gemini-1.5-flash";
 }
 
+// Per-key discovery cache (server memory)
+const modelCache = new Map<string, { model: string; alts: string[]; models: string[]; ts: number }>();
+const MODEL_TTL_MS = 30 * 60 * 1000;
+
 async function listModelsForKey(key: string): Promise<string[]> {
   try {
     const res = await fetch(`${GOOGLE_BASE}/models`, { headers: { "x-goog-api-key": key } });
@@ -35,29 +39,41 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, error: "Invalid format" }, { status: 200 });
     }
 
+    // Use cache
+    const frag = key.slice(0,8);
+    const cached = modelCache.get(frag);
+    const now = Date.now();
+
     // Discover available models for this key and pick best
-    let models = await listModelsForKey(key);
+    let models = cached && (now - cached.ts < MODEL_TTL_MS) ? cached.models : await listModelsForKey(key);
     if (!models.length) models = [sanitizeModel(RAW_CHAT_MODEL), "gemini-1.5-pro"];
     const alts = prioritize(models);
 
+    // Single-step validation: direct generateContent only, no metadata probe
     let lastError: any = null;
     for (const model of alts) {
-      // Probe metadata
-      const meta = await fetch(`${GOOGLE_BASE}/models/${model}`, { method: "GET", headers: { "x-goog-api-key": key } });
-      if (!meta.ok) { lastError = { which: "meta", status: meta.status, text: await meta.text().catch(()=>"") }; if (meta.status===403||meta.status===404) continue; }
-      // Probe generation
       const gen = await fetch(`${GOOGLE_BASE}/models/${model}:generateContent`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-goog-api-key": key },
         body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "ping" }] }], generationConfig: { maxOutputTokens: 1 } }),
       });
       if (gen.ok) {
-        return NextResponse.json({ ok: true, modelUsed: model }, { status: 200 });
-      } else {
-        const text = await gen.text().catch(()=>"");
-        lastError = { which: "gen", status: gen.status, text };
-        if (gen.status===403||gen.status===404) continue;
+        modelCache.set(frag, { model, alts, models, ts: now });
+        return NextResponse.json({ ok: true, modelUsed: model, availableModels: alts }, { status: 200 });
       }
+      const text = await gen.text().catch(()=>"");
+      // Treat 429 as a valid key but rate-limited; allow user to proceed
+      if (gen.status === 429) {
+        modelCache.set(frag, { model, alts, models, ts: now });
+        let msg = text;
+        try { const j = JSON.parse(text); msg = j?.error?.message || text; } catch {}
+        return NextResponse.json({ ok: true, modelUsed: model, availableModels: alts, rateLimited: true, note: msg?.slice?.(0, 200) }, { status: 200 });
+      }
+      // If the model is not accessible, try next
+      if (gen.status === 403 || gen.status === 404) { lastError = { status: gen.status, text }; continue; }
+      // Other errors: capture and stop trying more to avoid extra calls during validation
+      lastError = { status: gen.status, text };
+      break;
     }
 
     const status = lastError?.status || 400;
