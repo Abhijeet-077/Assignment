@@ -26,6 +26,18 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "models/text-embedding-004")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-1.5-flash")
 
+def sanitize_model(name: str) -> str:
+    import re
+    base = re.sub(r"-00\d$", "", name or "")
+    allowed = {"gemini-1.5-flash", "gemini-1.5-pro"}
+    return base if base in allowed else "gemini-1.5-flash"
+
+# Allow per-request override from Node client
+KEY_OVERRIDE = None  # type: ignore
+
+def get_key():
+    return KEY_OVERRIDE or os.getenv("GOOGLE_API_KEY")
+
 # ----------------------- Utilities -----------------------
 
 def classify_intent(q: str) -> str:
@@ -41,7 +53,8 @@ def load_vs(name: str):
     path = os.path.join(DATA_DIR, name)
     if not os.path.exists(path):
         return None
-    embeddings = GoogleGenerativeAIEmbeddings(model=EMBED_MODEL, google_api_key=GOOGLE_API_KEY) if GOOGLE_API_KEY else None
+    key = get_key()
+    embeddings = GoogleGenerativeAIEmbeddings(model=EMBED_MODEL, google_api_key=key) if key else None
     try:
         vs = FAISS.load_local(path, embeddings=embeddings, allow_dangerous_deserialization=True)
         return vs
@@ -78,34 +91,10 @@ def retrieve(query: str, hint: str, k: int = 6) -> Tuple[List[Document], List[fl
     if not candidates:
         return [], []
 
-    # Select top-k diverse via MMR over embeddings
-    # Get embeddings for candidates (approx via stored vectors if available)
-    # FAISS store in LC doesn't expose vectors; recompute embeddings quickly
-    
-    # treat certain placeholder strings as unset
-    is_placeholder = GOOGLE_API_KEY in {"YOUR_GOOGLE_API_KEY", "REPLACE_ME", "REDACTED"}
-
-    embeddings = GoogleGenerativeAIEmbeddings(model=EMBED_MODEL, google_api_key=GOOGLE_API_KEY) if GOOGLE_API_KEY and not is_placeholder else None
-    if not embeddings:
-        # fallback: sort by score only
-        candidates.sort(key=lambda x: x[1])  # lower distance better
-        docs = [d for d,_ in candidates[:k]]
-        scores = [1.0/(1.0+s) for _,s in candidates[:k]]
-        return docs, scores
-
-    texts = [doc.page_content for doc,_ in candidates]
-    q_vec = embeddings.embed_query(query)
-    c_vecs = [embeddings.embed_query(t) for t in texts]
-    selected_idxs = maximal_marginal_relevance(q_vec, c_vecs, lambda_mult=0.7, k=k)
-    docs = [candidates[i][0] for i in selected_idxs]
-    # Convert FAISS distance into similarity-ish score if available
-    scores = []
-    for i in selected_idxs:
-        try:
-            s = 1.0/(1.0 + float(candidates[i][1]))
-        except Exception:
-            s = 0.5
-        scores.append(s)
+    # Simplify: avoid extra embedding calls; rely on FAISS ranking to reduce quota usage
+    candidates.sort(key=lambda x: x[1])  # lower distance better
+    docs = [d for d,_ in candidates[:k]]
+    scores = [1.0/(1.0+s) for _,s in candidates[:k]]
     return docs, scores
 
 
@@ -118,11 +107,18 @@ def decide_mode(scores: List[float], intent: str) -> str:
     return "general"
 
 
+ENABLE_MEMORY_SUMMARY = os.getenv("ENABLE_MEMORY_SUMMARY", "0") == "1"
+
 def summarize_history(messages: List[Dict[str, str]], model_name: str = CHAT_MODEL) -> str:
-    if not messages or not GOOGLE_API_KEY:
+    if not ENABLE_MEMORY_SUMMARY:
         return ""
-    model = ChatGoogleGenerativeAI(model=model_name, google_api_key=GOOGLE_API_KEY, temperature=0.3)
-    # Keep last ~20 messages to limit cost
+    key = get_key()
+    if not messages or not key:
+        return ""
+    # Throttle: only summarize every 6th message to limit cost
+    if len(messages) % 6 != 0:
+        return ""
+    model = ChatGoogleGenerativeAI(model=sanitize_model(model_name), google_api_key=key, temperature=0.3)
     last = messages[-20:]
     text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in last])
     prompt = ("Summarize the following conversation briefly but keep key facts, user goals, constraints, and any conclusions.\n\n" + text)
@@ -172,11 +168,13 @@ _graph = build_graph()
 
 def handler(request):  # vercel python serverless entry
     from flask import Response
+    global KEY_OVERRIDE
     try:
         if request.method == "OPTIONS":
             return Response(status=200, headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*"})
         body_text = request.get_data(as_text=True) or "{}"
         data = json.loads(body_text)
+        KEY_OVERRIDE = data.get("apiKey") or None
         messages = data.get("messages", [])
         query = messages[-1].get("content") if messages else data.get("query", "")
         state = {"query": query}
@@ -205,6 +203,11 @@ def handler(request):  # vercel python serverless entry
         return Response(response=json.dumps(resp), status=200, headers={"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"})
     except Exception as e:
         return Response(response=json.dumps({"error": str(e)}), status=500, headers={"Content-Type": "application/json"})
+    finally:
+        try:
+            KEY_OVERRIDE = None
+        except Exception:
+            pass
 
 # Vercel requires a top-level named `handler` function
 

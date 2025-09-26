@@ -12,6 +12,11 @@ def main():
 
     body_text = sys.stdin.read() or "{}"
     data = json.loads(body_text)
+    # Allow client-provided key for local dev
+    try:
+        ragmod.KEY_OVERRIDE = data.get("apiKey") or None
+    except Exception:
+        pass
     messages = data.get("messages", [])
     query = messages[-1].get("content") if messages else data.get("query", "")
     state = {"query": query}

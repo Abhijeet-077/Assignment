@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
 
-type Msg = { role: "user" | "assistant"; content: string; sources?: any[]; confidence?: number };
+type Msg = { role: "user" | "assistant"; content: string; sources?: any[]; confidence?: number; modelUsed?: string };
 
 export default function Page() {
   const [messages, setMessages] = useState<Msg[]>([
@@ -11,6 +11,34 @@ export default function Page() {
   const [loading, setLoading] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
   const [hasFirstToken, setHasFirstToken] = useState(false);
+  // API key management
+  const [showKeyModal, setShowKeyModal] = useState(false);
+  const [apiKeyInput, setApiKeyInput] = useState("");
+  const [keyError, setKeyError] = useState("");
+  const [validatingKey, setValidatingKey] = useState(false);
+  const [hasServerKey, setHasServerKey] = useState<boolean | null>(null);
+  const [keySaved, setKeySaved] = useState(false);
+
+  useEffect(() => {
+    // On mount, detect if server has key; if not and no local key, force modal
+    (async () => {
+      let has = false;
+      try {
+        const res = await fetch("/api/health");
+        const data = await res.json();
+        has = Boolean(data?.hasKey);
+        setHasServerKey(has);
+      } catch {
+        setHasServerKey(false);
+      }
+      const stored = localStorage.getItem("gm_api_key") || "";
+      if (!stored && !has) {
+        // Require user key only if server has no key
+        setShowKeyModal(true);
+      }
+      setApiKeyInput(stored);
+    })();
+  }, []);
 
 
   useEffect(() => {
@@ -28,10 +56,11 @@ export default function Page() {
     // Attempt streaming first for better UX; fallback to non-streaming JSON
     try {
       const controller = new AbortController();
+      const key = (localStorage.getItem("gm_api_key") || "").trim();
       const res = await fetch("/api/chat/stream", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: [...messages, userMsg] }),
+        headers: { "Content-Type": "application/json", ...(key ? { "x-api-key": key } : {}) },
+        body: JSON.stringify({ messages: [...messages, userMsg], ...(key ? { apiKey: key } : {}) }),
         signal: controller.signal,
       });
       if (!res.ok || !res.body) throw new Error("Stream not available");
@@ -56,14 +85,31 @@ export default function Page() {
             if (m) meta = JSON.parse(m.replace(/^data:\s*/, ""));
             // Ensure a placeholder assistant message appears quickly
             if (!added) {
-              const assistant: Msg = { role: "assistant", content: "", sources: meta?.sources, confidence: meta?.confidence };
+              const assistant: Msg = { role: "assistant", content: "", sources: meta?.sources, confidence: meta?.confidence, modelUsed: meta?.modelUsed };
               setMessages((msgs) => { baseIndex = msgs.length; return [...msgs, assistant]; });
               added = true;
             }
             continue;
           }
           if (ev.startsWith("event: error")) {
-            throw new Error("Streaming error");
+            const m = ev.split("\n").find((l) => l.startsWith("data:"));
+            let details = "";
+            try { const j = m ? JSON.parse(m.replace(/^data:\s*/, "")) : null; details = j?.error || JSON.stringify(j); } catch {}
+            const friendly = details ? `Model error: ${details}` : "Model error occurred.";
+            if (!added) {
+              const assistant: Msg = { role: "assistant", content: friendly, sources: meta?.sources, confidence: meta?.confidence, modelUsed: meta?.modelUsed };
+              setMessages((msgs) => { baseIndex = msgs.length; return [...msgs, assistant]; });
+              added = true;
+            } else {
+              assistantText += (assistantText ? "\n\n" : "") + friendly;
+              setMessages((m) => {
+                const copy = m.slice();
+                const last = copy[baseIndex];
+                copy[baseIndex] = { ...last, content: assistantText, sources: meta?.sources, confidence: meta?.confidence };
+                return copy;
+              });
+            }
+            continue;
           }
           if (ev.startsWith("event: end")) {
             continue;
@@ -76,7 +122,7 @@ export default function Page() {
           // Each chunk may have candidates with content.parts[].text
           const piece = payload?.candidates?.[0]?.content?.parts?.map((p: any) => p.text).join("") || "";
           if (!added) {
-            const assistant: Msg = { role: "assistant", content: piece, sources: meta?.sources, confidence: meta?.confidence };
+            const assistant: Msg = { role: "assistant", content: piece, sources: meta?.sources, confidence: meta?.confidence, modelUsed: meta?.modelUsed };
             setMessages((msgs) => { baseIndex = msgs.length; return [...msgs, assistant]; });
             added = true;
             if (piece) setHasFirstToken(true);
@@ -85,7 +131,7 @@ export default function Page() {
             setMessages((m) => {
               const copy = m.slice();
               const last = copy[baseIndex];
-              copy[baseIndex] = { ...last, content: (assistantText || piece), sources: meta?.sources, confidence: meta?.confidence };
+              copy[baseIndex] = { ...last, content: (assistantText || piece), sources: meta?.sources, confidence: meta?.confidence, modelUsed: meta?.modelUsed };
               return copy;
             });
             setHasFirstToken(true);
@@ -98,13 +144,14 @@ export default function Page() {
 
     // Fallback to non-streaming
     try {
+      const key = (localStorage.getItem("gm_api_key") || "").trim();
       const res = await fetch("/api/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: [...messages, userMsg] }),
+        headers: { "Content-Type": "application/json", ...(key ? { "x-api-key": key } : {}) },
+        body: JSON.stringify({ messages: [...messages, userMsg], ...(key ? { apiKey: key } : {}) }),
       });
       const data = await res.json();
-      const assistant: Msg = { role: "assistant", content: data.text, sources: data.sources, confidence: data.confidence };
+      const assistant: Msg = { role: "assistant", content: data.text, sources: data.sources, confidence: data.confidence, modelUsed: data.modelUsed };
       setMessages((m) => [...m, assistant]);
     } catch (e: any) {
       setMessages((m) => [...m, { role: "assistant", content: "Sorry, something went wrong." }]);
@@ -139,6 +186,9 @@ export default function Page() {
                 <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 4 }}>{isAssistant ? "Assistant" : "You"}</div>
                 <div style={{ background: isAssistant ? "#111936" : "#1c244a", border: "1px solid #243066", padding: 12, borderRadius: 10, whiteSpace: "normal", lineHeight: 1.6 }}>
                   <RichText text={m.content} />
+                  {isAssistant && m.modelUsed ? (
+                    <div style={{ marginTop: 6, fontSize: 11, opacity: 0.8 }}>Model: {m.modelUsed}</div>
+                  ) : null}
                   {isAssistant && m.sources?.length ? (
                     <div style={{ marginTop: 8, fontSize: 12, opacity: 0.85 }}>
                       <div>Sources:</div>
@@ -166,7 +216,20 @@ export default function Page() {
 
         </div>
         <div style={{ padding: 12, borderTop: "1px solid #22306a", background: "#0b1020", borderBottomLeftRadius: 16, borderBottomRightRadius: 16 }}>
-          <div style={{ display: "flex", gap: 8 }}>
+          <div style={{ display: "flex", gap: 8, alignItems: 'flex-end' }}>
+            <button onClick={() => { setApiKeyInput(localStorage.getItem('gm_api_key') || ''); setKeyError(''); setShowKeyModal(true); }}
+              title="API Key Settings"
+              style={{
+                height: 36,
+                padding: "0 10px",
+                background: "#1a244f",
+                color: "#c9d4ff",
+                border: "1px solid #2b3a78",
+                borderRadius: 8,
+                cursor: 'pointer'
+              }}>
+              API Key
+            </button>
             <textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
@@ -213,6 +276,62 @@ export default function Page() {
             background: radial-gradient(circle at 30% 30%, rgba(255,255,255,0.7), rgba(255,255,255,0.05) 35%, rgba(0,0,0,0.35) 70%); }
         `}</style>
 
+      {showKeyModal && (
+        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.6)', display:'flex', alignItems:'center', justifyContent:'center', zIndex: 50 }}>
+          <div style={{ width:'min(92vw, 520px)', background:'#0e1533', border:'1px solid #2b3a78', borderRadius:12, padding:16 }}>
+            <div style={{ fontWeight:700, fontSize:18, marginBottom:6 }}>Google Gemini API Key Required</div>
+            <div style={{ fontSize:13, opacity:0.9, marginBottom:10 }}>
+              Enter your Google Gemini API key to use the chatbot. You can get a key from Google AI Studio.
+              <a href="https://aistudio.google.com/app/apikey" target="_blank" style={{ marginLeft:6, color:'#8fb3ff', textDecoration:'underline' }}>Learn More</a>
+            </div>
+            <input
+              value={apiKeyInput}
+              onChange={(e)=>{ setApiKeyInput(e.target.value); setKeyError(''); }}
+              placeholder="Enter API key (starts with AIza...)"
+              style={{ width:'100%', padding:'10px 12px', border:'1px solid #2b3a78', borderRadius:8, background:'#0f1736', color:'#f5f7ff' }}
+            />
+            {keyError ? (
+              <div style={{ color:'#ff7a7a', fontSize:12, marginTop:6 }}>
+                {keyError}
+                <div style={{ marginTop:4, opacity:0.9 }}>
+                  Tips: Ensure this is a Google AI Studio key, remove IP/Referrer restrictions while testing, and enable billing/quota for Generative Language API.
+                </div>
+              </div>
+            ) : null}
+            {keySaved ? <div style={{ color:'#7cff98', fontSize:12, marginTop:6 }}>Key saved and validated. You can start chatting.</div> : null}
+            <div style={{ display:'flex', justifyContent:'flex-end', marginTop:12, gap:8 }}>
+              <div style={{ flex:1, fontSize:12, color:'#b2beff' }}>Do not share your API key. It will be stored locally in your browser.</div>
+              <button
+                onClick={async ()=>{
+                  setKeyError('');
+                  const key = (apiKeyInput||'').trim();
+                  if (!/^AIza[0-9A-Za-z\-_]{20,}$/.test(key)) { setKeyError('Please enter a valid-looking key (starts with AIza).'); return; }
+                  setValidatingKey(true);
+                  try {
+                    const res = await fetch('/api/validate-key', { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ apiKey: key }) });
+                    const data = await res.json();
+                    if (!data?.ok) {
+                      const detail = (data?.error ? String(data.error) : '') || (data?.status ? `Validation failed (status ${data.status}).` : 'Validation failed.');
+                      setKeyError(detail);
+                      return;
+                    }
+                    localStorage.setItem('gm_api_key', key);
+                    setKeySaved(true);
+                    setTimeout(()=>{ setShowKeyModal(false); setKeySaved(false); }, 900);
+                  } catch (e:any) {
+                    setKeyError('Validation failed. Please try again.');
+                  } finally {
+                    setValidatingKey(false);
+                  }
+                }}
+                style={{ padding:'10px 14px', background: validatingKey ? '#2b386f' : '#3041a7', color:'#fff', border:'none', borderRadius:8, cursor: validatingKey ? 'not-allowed' : 'pointer' }}
+                disabled={validatingKey}
+              >{validatingKey ? 'Validating...' : 'Save & Continue'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }
@@ -246,8 +365,10 @@ function RichText({ text }: { text: string }) {
         return <p key={i} style={{ margin: '0 0 8px 0' }}>{block}</p>;
       })}
     </div>
+
   );
 }
+
 
 function Header() {
   return (
