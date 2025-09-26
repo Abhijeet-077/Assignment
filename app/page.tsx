@@ -85,6 +85,7 @@ export default function Page() {
       const dec = new TextDecoder();
       let assistantText = "";
       let meta: any = null;
+      let sseBuf = "";
       // create placeholder assistant message
       let added = false;
       let baseIndex = -1;
@@ -134,10 +135,13 @@ export default function Page() {
           // Default Google stream chunks are "data: {json}"
           const line = ev.split("\n").find((l) => l.startsWith("data:"));
           if (!line) continue;
+          const raw = line.replace(/^data:\s*/, "");
+          sseBuf += raw;
           let payload: any;
-          try { payload = JSON.parse(line.replace(/^data:\s*/, "")); } catch { continue; }
+          try { payload = JSON.parse(sseBuf); sseBuf = ""; } catch { continue; }
           // Each chunk may have candidates with content.parts[].text
-          const piece = payload?.candidates?.[0]?.content?.parts?.map((p: any) => p.text).join("") || ""; if (meta && payload?.availableModels && !meta.availableModels) { meta.availableModels = payload.availableModels; }
+          const piece = payload?.candidates?.[0]?.content?.parts?.map((p: any) => p.text).join("") || "";
+          if (meta && payload?.availableModels && !meta.availableModels) { meta.availableModels = payload.availableModels; }
           if (!added) {
             const assistant: Msg = { role: "assistant", content: piece, sources: meta?.sources, confidence: meta?.confidence, modelUsed: meta?.modelUsed, modelsAvailable: meta?.availableModels };
             setMessages((msgs) => { baseIndex = msgs.length; return [...msgs, assistant]; });
@@ -154,6 +158,9 @@ export default function Page() {
             setHasFirstToken(true);
           }
         }
+      }
+      if (!hasFirstToken && !assistantText) {
+        throw new Error("Empty stream");
       }
       setLoading(false);
       return;

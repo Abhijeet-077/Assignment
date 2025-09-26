@@ -39,13 +39,12 @@ async function listModelsForKey(key: string): Promise<string[]> {
 }
 
 function prioritize(models: string[]): string[] {
-  const order = (m: string) => (
-    m.startsWith("gemini-1.5-flash") ? 1 :
-    m.startsWith("gemini-1.5-pro")   ? 2 :
-    m.startsWith("gemini-2.0-")      ? 3 :
-    m.startsWith("gemini-1.0-")      ? 4 :
-    9
-  );
+  const order = (m: string) => {
+    const l = m.toLowerCase();
+    return l.startsWith("gemini-2.0-") ? 1 :
+           l.startsWith("gemini-1.5-") ? 2 :
+           l.startsWith("gemini-1.0-") ? 3 : 9;
+  };
   return models.slice().sort((a,b)=> order(a)-order(b));
 }
 
