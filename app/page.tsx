@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
 
-type Msg = { role: "user" | "assistant"; content: string; sources?: any[]; confidence?: number; modelUsed?: string };
+type Msg = { role: "user" | "assistant"; content: string; sources?: any[]; confidence?: number; modelUsed?: string; modelsAvailable?: string[] };
 
 export default function Page() {
   const [messages, setMessages] = useState<Msg[]>([
@@ -18,6 +18,8 @@ export default function Page() {
   const [validatingKey, setValidatingKey] = useState(false);
   const [hasServerKey, setHasServerKey] = useState<boolean | null>(null);
   const [keySaved, setKeySaved] = useState(false);
+  const [selectedModel, setSelectedModel] = useState<string>("");
+  const [modelsAvailable, setModelsAvailable] = useState<string[]>([]);
 
   useEffect(() => {
     // On mount, detect if server has key; if not and no local key, force modal
@@ -37,6 +39,16 @@ export default function Page() {
         setShowKeyModal(true);
       }
       setApiKeyInput(stored);
+      const pref = (localStorage.getItem("gm_model_preference") || "").trim();
+      if (pref) setSelectedModel(pref);
+      // Proactively fetch available models so dropdown is populated before first chat
+      if (stored) {
+        try {
+          const vr = await fetch('/api/validate-key', { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ apiKey: stored }) });
+          const vd = await vr.json();
+          if (vd?.ok && Array.isArray(vd.availableModels)) setModelsAvailable(vd.availableModels);
+        } catch {}
+      }
     })();
   }, []);
 
@@ -57,10 +69,14 @@ export default function Page() {
     try {
       const controller = new AbortController();
       const key = (localStorage.getItem("gm_api_key") || "").trim();
+      const pref = (localStorage.getItem("gm_model_preference") || "").trim();
+      const headers: any = { "Content-Type": "application/json", ...(key ? { "x-api-key": key } : {}) };
+      if (pref) headers["x-model"] = pref;
+      const body = { messages: [...messages, userMsg], ...(key ? { apiKey: key } : {}), ...(pref ? { model: pref } : {}) };
       const res = await fetch("/api/chat/stream", {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...(key ? { "x-api-key": key } : {}) },
-        body: JSON.stringify({ messages: [...messages, userMsg], ...(key ? { apiKey: key } : {}) }),
+        headers,
+        body: JSON.stringify(body),
         signal: controller.signal,
       });
       if (!res.ok || !res.body) throw new Error("Stream not available");
@@ -83,6 +99,7 @@ export default function Page() {
           if (ev.startsWith("event: meta")) {
             const m = ev.split("\n").find((l) => l.startsWith("data:"));
             if (m) meta = JSON.parse(m.replace(/^data:\s*/, ""));
+            if (Array.isArray(meta?.availableModels)) setModelsAvailable(meta.availableModels);
             // Ensure a placeholder assistant message appears quickly
             if (!added) {
               const assistant: Msg = { role: "assistant", content: "", sources: meta?.sources, confidence: meta?.confidence, modelUsed: meta?.modelUsed };
@@ -97,7 +114,7 @@ export default function Page() {
             try { const j = m ? JSON.parse(m.replace(/^data:\s*/, "")) : null; details = j?.error || JSON.stringify(j); } catch {}
             const friendly = details ? `Model error: ${details}` : "Model error occurred.";
             if (!added) {
-              const assistant: Msg = { role: "assistant", content: friendly, sources: meta?.sources, confidence: meta?.confidence, modelUsed: meta?.modelUsed };
+              const assistant: Msg = { role: "assistant", content: friendly, sources: meta?.sources, confidence: meta?.confidence, modelUsed: meta?.modelUsed, modelsAvailable: meta?.availableModels };
               setMessages((msgs) => { baseIndex = msgs.length; return [...msgs, assistant]; });
               added = true;
             } else {
@@ -105,7 +122,7 @@ export default function Page() {
               setMessages((m) => {
                 const copy = m.slice();
                 const last = copy[baseIndex];
-                copy[baseIndex] = { ...last, content: assistantText, sources: meta?.sources, confidence: meta?.confidence };
+                copy[baseIndex] = { ...last, content: assistantText, sources: meta?.sources, confidence: meta?.confidence, modelsAvailable: meta?.availableModels };
                 return copy;
               });
             }
@@ -120,9 +137,9 @@ export default function Page() {
           let payload: any;
           try { payload = JSON.parse(line.replace(/^data:\s*/, "")); } catch { continue; }
           // Each chunk may have candidates with content.parts[].text
-          const piece = payload?.candidates?.[0]?.content?.parts?.map((p: any) => p.text).join("") || "";
+          const piece = payload?.candidates?.[0]?.content?.parts?.map((p: any) => p.text).join("") || ""; if (meta && payload?.availableModels && !meta.availableModels) { meta.availableModels = payload.availableModels; }
           if (!added) {
-            const assistant: Msg = { role: "assistant", content: piece, sources: meta?.sources, confidence: meta?.confidence, modelUsed: meta?.modelUsed };
+            const assistant: Msg = { role: "assistant", content: piece, sources: meta?.sources, confidence: meta?.confidence, modelUsed: meta?.modelUsed, modelsAvailable: meta?.availableModels };
             setMessages((msgs) => { baseIndex = msgs.length; return [...msgs, assistant]; });
             added = true;
             if (piece) setHasFirstToken(true);
@@ -131,7 +148,7 @@ export default function Page() {
             setMessages((m) => {
               const copy = m.slice();
               const last = copy[baseIndex];
-              copy[baseIndex] = { ...last, content: (assistantText || piece), sources: meta?.sources, confidence: meta?.confidence, modelUsed: meta?.modelUsed };
+              copy[baseIndex] = { ...last, content: (assistantText || piece), sources: meta?.sources, confidence: meta?.confidence, modelUsed: meta?.modelUsed, modelsAvailable: meta?.availableModels };
               return copy;
             });
             setHasFirstToken(true);
@@ -145,13 +162,18 @@ export default function Page() {
     // Fallback to non-streaming
     try {
       const key = (localStorage.getItem("gm_api_key") || "").trim();
+      const pref = (localStorage.getItem("gm_model_preference") || "").trim();
+      const headers: any = { "Content-Type": "application/json", ...(key ? { "x-api-key": key } : {}) };
+      if (pref) headers["x-model"] = pref;
+      const body = { messages: [...messages, userMsg], ...(key ? { apiKey: key } : {}), ...(pref ? { model: pref } : {}) };
       const res = await fetch("/api/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...(key ? { "x-api-key": key } : {}) },
-        body: JSON.stringify({ messages: [...messages, userMsg], ...(key ? { apiKey: key } : {}) }),
+        headers,
+        body: JSON.stringify(body),
       });
       const data = await res.json();
-      const assistant: Msg = { role: "assistant", content: data.text, sources: data.sources, confidence: data.confidence, modelUsed: data.modelUsed };
+      if (Array.isArray(data.availableModels)) setModelsAvailable(data.availableModels);
+      const assistant: Msg = { role: "assistant", content: data.text, sources: data.sources, confidence: data.confidence, modelUsed: data.modelUsed, modelsAvailable: data.availableModels };
       setMessages((m) => [...m, assistant]);
     } catch (e: any) {
       setMessages((m) => [...m, { role: "assistant", content: "Sorry, something went wrong." }]);
@@ -187,7 +209,15 @@ export default function Page() {
                 <div style={{ background: isAssistant ? "#111936" : "#1c244a", border: "1px solid #243066", padding: 12, borderRadius: 10, whiteSpace: "normal", lineHeight: 1.6 }}>
                   <RichText text={m.content} />
                   {isAssistant && m.modelUsed ? (
-                    <div style={{ marginTop: 6, fontSize: 11, opacity: 0.8 }}>Model: {m.modelUsed}</div>
+                    <div style={{ marginTop: 6, fontSize: 11, opacity: 0.8 }}>
+                      Model: {m.modelUsed}
+                      {Array.isArray(m.modelsAvailable) && m.modelsAvailable.length ? (
+                        <>
+                          <span> • Available: </span>
+                          <span title={m.modelsAvailable.join(", ")}>{m.modelsAvailable.slice(0,6).join(", ")}{m.modelsAvailable.length>6?"…":""}</span>
+                        </>
+                      ) : null}
+                    </div>
                   ) : null}
                   {isAssistant && m.sources?.length ? (
                     <div style={{ marginTop: 8, fontSize: 12, opacity: 0.85 }}>
@@ -230,6 +260,14 @@ export default function Page() {
               }}>
               API Key
             </button>
+            <select
+              value={selectedModel}
+              onChange={(e)=>{ const v=e.target.value; setSelectedModel(v); localStorage.setItem('gm_model_preference', v); }}
+              title="Model preference"
+              style={{ height: 36, padding: '0 8px', background:'#1a244f', color:'#c9d4ff', border:'1px solid #2b3a78', borderRadius:8 }}>
+              <option value="">Auto</option>
+              {modelsAvailable.map((m)=> (<option key={m} value={m}>{m}</option>))}
+            </select>
             <textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
@@ -316,6 +354,7 @@ export default function Page() {
                       return;
                     }
                     localStorage.setItem('gm_api_key', key);
+                    if (Array.isArray(data.availableModels)) setModelsAvailable(data.availableModels);
                     setKeySaved(true);
                     setTimeout(()=>{ setShowKeyModal(false); setKeySaved(false); }, 900);
                   } catch (e:any) {

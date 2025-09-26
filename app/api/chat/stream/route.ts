@@ -8,10 +8,9 @@ export const runtime = "nodejs";
 const CHAT_MODEL = process.env.CHAT_MODEL || "gemini-1.5-flash";
 const GOOGLE_BASE = "https://generativelanguage.googleapis.com/v1beta";
 
-function sanitizeModel(model: string): string {
-  const base = model.replace(/-00\d$/i, "");
-  const allowed = new Set(["gemini-1.5-flash", "gemini-1.5-pro"]);
-  return allowed.has(base) ? base : "gemini-1.5-flash";
+function sanitizeModel(name: string): string {
+  // Keep exact model id as returned by AI Studio (only strip optional prefix)
+  return String(name || "").replace(/^models\/?/i, "").trim();
 }
 
 const modelCache = new Map<string, { model: string; alts: string[]; ts: number }>();
@@ -27,7 +26,12 @@ async function listModelsForKey(key: string): Promise<string[]> {
   } catch { return []; }
 }
 function prioritize(models: string[]): string[] {
-  const order = (m: string) => (m === "gemini-1.5-flash" ? 1 : m === "gemini-1.5-pro" ? 2 : m.startsWith("gemini-1.5-") ? 3 : m.startsWith("gemini-1.0-") ? 4 : 9);
+  const order = (m: string) => {
+    const l = m.toLowerCase();
+    return l.startsWith("gemini-2.0-") ? 1 :
+           l.startsWith("gemini-1.5-") ? 2 :
+           l.startsWith("gemini-1.0-") ? 3 : 9;
+  };
   return models.slice().sort((a,b)=> order(a)-order(b));
 }
 async function getBestModelForKey(key: string): Promise<{ model: string; alts: string[] }>{
@@ -77,6 +81,8 @@ async function callRagService(messages: any[], apiKey?: string) {
       if (res.ok) return await res.json();
     } catch {}
   }
+  // On Vercel (serverless), do not attempt to spawn Python; return null to continue without RAG
+  if (process.env.VERCEL || process.env.NOW_REGION) return null as any;
   return await callRagCLI(messages, apiKey);
 }
 
@@ -117,34 +123,43 @@ export async function POST(req: NextRequest) {
         const key = (providedKey && !["YOUR_GOOGLE_API_KEY","REPLACE_ME","REDACTED"].includes(providedKey)) ? providedKey : process.env.GOOGLE_API_KEY;
         if (!key || ["YOUR_GOOGLE_API_KEY","REPLACE_ME","REDACTED"].includes(key)) throw new Error("Missing or placeholder GOOGLE_API_KEY");
         const { model, alts } = await getBestModelForKey(key);
+        const requested = (body?.model && String(body.model)) || req.headers.get("x-model") || "";
+        const candidates = requested && alts.includes(requested)
+          ? [requested, ...alts.filter((x)=> x !== requested)]
+          : (alts.length ? alts : [model]);
         const contents = [ { role: "user", parts: [{ text: prompt }] } ];
-        let chosen = model; let success = false;
-        for (const m of (alts.length ? alts : [model])) {
+        let success = false;
+        for (const m of candidates) {
           const url = `${GOOGLE_BASE}/models/${m}:streamGenerateContent`;
-          const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": key }, body: JSON.stringify({ contents }) });
-          if (!res.ok || !res.body) {
-            let bodyTxt = ""; try { bodyTxt = await res.text(); } catch {}
-            if (res.status === 403 || res.status === 404) { chosen = m; continue; }
-            controller.enqueue(encoder.encode(`event: error\n` + `data: ${JSON.stringify({ status: res.status, error: bodyTxt?.slice?.(0, 300) || 'No details' })}\n\n`));
-            const fallback = { candidates: [{ content: { parts: [{ text: "I’m having trouble reaching the model right now. Please verify your API key permissions and quota." }] } }] };
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify(fallback)}\n\n`));
+          let attempt = 0;
+          while (true) {
+            const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": key }, body: JSON.stringify({ contents }) });
+            if (!res.ok || !res.body) {
+              let bodyTxt = ""; try { bodyTxt = await res.text(); } catch {}
+              if (res.status === 403 || res.status === 404) { break; }
+              if (res.status === 429 && attempt < 5) { attempt++; const base=600; const delay=Math.min(8000, Math.floor(base*Math.pow(2, attempt)) + Math.floor(Math.random()*250)); await new Promise(r=>setTimeout(r, delay)); continue; }
+              controller.enqueue(encoder.encode(`event: error\n` + `data: ${JSON.stringify({ status: res.status, error: bodyTxt?.slice?.(0, 300) || 'No details' })}\n\n`));
+              const fallback = { candidates: [{ content: { parts: [{ text: "I’m having trouble reaching the model right now. Please verify your API key permissions and quota." }] } }] };
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(fallback)}\n\n`));
+              controller.enqueue(encoder.encode(`event: end\n\n`));
+              controller.close();
+              return;
+            }
+            // Emit meta as soon as we have a working stream, with modelUsed
+            controller.enqueue(encoder.encode(`event: meta\n` + `data: ${JSON.stringify({ sources: top, confidence, intent, mode, modelUsed: m, availableModels: alts })}\n\n`));
+            const reader = res.body.getReader();
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              const chunk = new TextDecoder().decode(value);
+              controller.enqueue(encoder.encode(`data: ${chunk}\n\n`));
+            }
             controller.enqueue(encoder.encode(`event: end\n\n`));
             controller.close();
-            return;
+            success = true;
+            break;
           }
-          // Emit meta as soon as we have a working stream, with modelUsed
-          controller.enqueue(encoder.encode(`event: meta\n` + `data: ${JSON.stringify({ sources: top, confidence, intent, mode, modelUsed: m })}\n\n`));
-          const reader = res.body.getReader();
-          while (true) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            const chunk = new TextDecoder().decode(value);
-            controller.enqueue(encoder.encode(`data: ${chunk}\n\n`));
-          }
-          controller.enqueue(encoder.encode(`event: end\n\n`));
-          controller.close();
-          success = true; chosen = m;
-          break;
+          if (success) break;
         }
         if (!success) {
           controller.enqueue(encoder.encode(`event: error\n` + `data: ${JSON.stringify({ error: 'All candidate models failed for this key.' })}\n\n`));

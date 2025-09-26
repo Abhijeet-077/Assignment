@@ -5,11 +5,9 @@ import { NextRequest, NextResponse } from "next/server";
 const GOOGLE_BASE = "https://generativelanguage.googleapis.com/v1beta";
 const RAW_CHAT_MODEL = process.env.CHAT_MODEL || "gemini-1.5-flash";
 
-function sanitizeModel(model: string): string {
-  // Strip Vertex-style version suffixes like -001/-002 and map to AI Studio stable names
-  const base = model.replace(/-00\d$/i, "");
-  const allowed = new Set(["gemini-1.5-flash", "gemini-1.5-pro"]);
-  return allowed.has(base) ? base : "gemini-1.5-flash";
+function sanitizeModel(name: string): string {
+  // Keep exact model id as returned by AI Studio (only strip optional prefix)
+  return String(name || "").replace(/^models\/?/i, "").trim();
 }
 
 // Per-key discovery cache (server memory)
@@ -27,7 +25,12 @@ async function listModelsForKey(key: string): Promise<string[]> {
   } catch { return []; }
 }
 function prioritize(models: string[]): string[] {
-  const order = (m: string) => (m === "gemini-1.5-flash" ? 1 : m === "gemini-1.5-pro" ? 2 : m.startsWith("gemini-1.5-") ? 3 : m.startsWith("gemini-1.0-") ? 4 : 9);
+  const order = (m: string) => {
+    const l = m.toLowerCase();
+    return l.startsWith("gemini-2.0-") ? 1 :
+           l.startsWith("gemini-1.5-") ? 2 :
+           l.startsWith("gemini-1.0-") ? 3 : 9;
+  };
   return models.slice().sort((a,b)=> order(a)-order(b));
 }
 

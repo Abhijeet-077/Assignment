@@ -9,10 +9,9 @@ export const runtime = "nodejs"; // allow fs
 const CHAT_MODEL = process.env.CHAT_MODEL || "gemini-1.5-flash";
 const GOOGLE_BASE = "https://generativelanguage.googleapis.com/v1beta";
 
-function sanitizeModel(model: string): string {
-  const base = model.replace(/-00\d$/i, "");
-  const allowed = new Set(["gemini-1.5-flash", "gemini-1.5-pro"]);
-  return allowed.has(base) ? base : "gemini-1.5-flash";
+function sanitizeModel(name: string): string {
+  // Keep exact model id as returned by AI Studio (only strip optional prefix)
+  return String(name || "").replace(/^models\/?/i, "").trim();
 }
 
 // Simple per-key model cache to avoid repeated discovery
@@ -41,10 +40,10 @@ async function listModelsForKey(key: string): Promise<string[]> {
 
 function prioritize(models: string[]): string[] {
   const order = (m: string) => (
-    m === "gemini-1.5-flash" ? 1 :
-    m === "gemini-1.5-pro" ? 2 :
-    m.startsWith("gemini-1.5-") ? 3 :
-    m.startsWith("gemini-1.0-") ? 4 :
+    m.startsWith("gemini-1.5-flash") ? 1 :
+    m.startsWith("gemini-1.5-pro")   ? 2 :
+    m.startsWith("gemini-2.0-")      ? 3 :
+    m.startsWith("gemini-1.0-")      ? 4 :
     9
   );
   return models.slice().sort((a,b)=> order(a)-order(b));
@@ -79,7 +78,7 @@ function rateLimit(key: string, limit = Number(process.env.RATE_LIMIT_RPM || 10)
   if (rec.count > limit) throw new Error("Rate limit exceeded, try again later.");
 }
 
-async function callGemini(prompt: string, history: { role: string; content: string }[], providedKey?: string): Promise<{ text: string; modelUsed: string }> {
+async function callGemini(prompt: string, history: { role: string; content: string }[], providedKey?: string, requestedModel?: string): Promise<{ text: string; modelUsed: string; availableModels?: string[] }> {
   const professionalPrefix = "Please answer professionally with short paragraphs and bullet points where suitable.";
   const sysPrompt = `${professionalPrefix}\n\n${prompt}`;
   const key = (providedKey && !["YOUR_GOOGLE_API_KEY","REPLACE_ME","REDACTED"].includes(providedKey))
@@ -94,7 +93,9 @@ async function callGemini(prompt: string, history: { role: string; content: stri
   ];
   const frag = key.slice(0, 8);
   const base = await getBestModelForKey(key);
-  const candidates = base.alts.length ? base.alts : [base.model];
+  const candidates = (requestedModel && base.alts.includes(requestedModel))
+    ? [requestedModel, ...base.alts.filter((x)=> x !== requestedModel)]
+    : (base.alts.length ? base.alts : [base.model]);
   for (const model of candidates) {
     try {
       const url = `${GOOGLE_BASE}/models/${model}:generateContent`;
@@ -109,14 +110,14 @@ async function callGemini(prompt: string, history: { role: string; content: stri
           const text = await res.text();
           console.error("Gemini API error", model, res.status, text?.slice?.(0, 400));
           if (res.status === 403 || res.status === 404) { attempt = 99; break; }
-          if (res.status === 429 && attempt < 2) { attempt++; await new Promise(r=>setTimeout(r, 600 * attempt)); continue; }
+          if (res.status === 429 && attempt < 5) { attempt++; const base=600; const delay=Math.min(8000, Math.floor(base*Math.pow(2, attempt)) + Math.floor(Math.random()*250)); await new Promise(r=>setTimeout(r, delay)); continue; }
           const mapped = mapGoogleError(res.status, text);
-          return { text: mapped.userMessage, modelUsed: model };
+          return { text: mapped.userMessage, modelUsed: model, availableModels: candidates };
         }
         const data = await res.json();
         const text = data?.candidates?.[0]?.content?.parts?.map((p: any) => p.text).join("\n") ?? "";
         modelCache.set(frag, { model, alts: candidates, ts: Date.now() });
-        return { text: text || "I couldnt find a clear answer. Could you please rephrase or add more detail?", modelUsed: model };
+        return { text: text || "I couldnt find a clear answer. Could you please rephrase or add more detail?", modelUsed: model, availableModels: candidates };
       }
       if (attempt === 99) continue;
     } catch (e: any) {
@@ -180,6 +181,8 @@ async function callRagService(messages: any[], apiKey?: string) {
       if (res.ok) return await res.json();
     } catch {}
   }
+  // On Vercel (serverless), do not attempt to spawn Python; return null to continue without RAG
+  if (process.env.VERCEL || process.env.NOW_REGION) return null as any;
   // Fallback to local CLI for dev if HTTP not available
   return await callRagCLI(messages, apiKey);
 }
@@ -229,7 +232,8 @@ export async function POST(req: NextRequest) {
     const prompt = `${system}\n\nUser question:\n${userQuery}\n\n${contextBlock || "(No special context)"}\n\nGuidance: ${domainGuide}\n\nRespond clearly and cite sources if any.`;
 
     const history = messages.slice(0, -1).map((m: any) => ({ role: m.role, content: m.content }));
-    const { text: answer, modelUsed } = await callGemini(prompt, history, providedKey);
+    const requestedModel = (body?.model && String(body.model)) || req.headers.get("x-model") || "";
+    const { text: answer, modelUsed } = await callGemini(prompt, history, providedKey, requestedModel);
 
     const maxScore = Math.max(0, ...top.map((c: any) => c.score ?? 0));
     const confidence = Math.max(0.3, Math.min(0.98, 0.5 + maxScore * 0.5));
